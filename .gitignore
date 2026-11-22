@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+.env
+.env.*
+oauth-sessions.json
+oauth-sessions.json.pending
+# reverse-engineering artifacts: extracted proprietary app code + capture scripts
+# (contain device ids / session material — never publish)
+_research/
