@@ -10,7 +10,7 @@
 // Behavior: on session_connect → session_established + connected; on
 // user_message → runs `script(userPayload)` which returns an array of inner
 // events ({type, payload, thread_id?}) emitted in order, then closes the turn.
-import { createServer } from 'node:http'
+import { createServer } from 'node:net'
 import { createHash, randomUUID } from 'node:crypto'
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
@@ -100,25 +100,38 @@ export async function startFakeQuick({ script, session } = {}) {
   }
   const sockets = new Set()
 
-  const server = createServer()
-  server.on('upgrade', (req, socket) => {
-    const key = req.headers['sec-websocket-key']
-    if (!key) { socket.destroy(); return }
-    const accept = createHash('sha1').update(key + WS_GUID).digest('base64')
-    socket.write(
-      'HTTP/1.1 101 Switching Protocols\r\n' +
-      'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
-      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-    )
-    socket.setNoDelay(true)
-    state.connections++
-    state.urls.push(req.url || '')
+  const server = createServer((socket) => {
     sockets.add(socket)
+    let reqBuf = Buffer.alloc(0)
+    let upgraded = false
     let buf = Buffer.alloc(0)
     const sendEs = (inner, threadId) => {
       try { socket.write(wsEncode(esEncode(JSON.stringify(inner), { threadId }))) } catch {}
     }
     socket.on('data', (chunk) => {
+      if (!upgraded) {
+        reqBuf = Buffer.concat([reqBuf, chunk])
+        const end = reqBuf.indexOf('\r\n\r\n')
+        if (end === -1) return
+        const head = reqBuf.subarray(0, end).toString('latin1')
+        const url = /^GET\s+(\S+)\s+HTTP\/1\.1/i.exec(head)?.[1] || ''
+        const key = /^sec-websocket-key:\s*(.+)$/im.exec(head)?.[1]?.trim()
+        if (!key) { socket.destroy(); return }
+        const accept = createHash('sha1').update(key + WS_GUID).digest('base64')
+        socket.setNoDelay(true)
+        socket.write(
+          'HTTP/1.1 101 Switching Protocols\r\n' +
+          'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+          `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+        )
+        upgraded = true
+        state.connections++
+        state.urls.push(url)
+        const extra = reqBuf.subarray(end + 4)
+        reqBuf = Buffer.alloc(0)
+        if (!extra.length) return
+        chunk = extra
+      }
       buf = Buffer.concat([buf, chunk])
       const { frames, rest } = takeFrames(buf)
       buf = rest
