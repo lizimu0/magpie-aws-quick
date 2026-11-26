@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { startFakeQuick, defaultScript } from './helpers/fake-quick.mjs'
 import { handleChatCompletions, handleModels } from '../lib/handler.mjs'
 import { createSessionStore } from '../lib/sessions.mjs'
-import { byteLen } from '../lib/translate.mjs'
+import { byteLen, jsonTextBytes } from '../lib/translate.mjs'
 import { OutpostError } from '../lib/outpost.mjs'
 
 let fake
@@ -32,7 +32,7 @@ function req(body, extra = {}) {
     body,
     outpostMgr,
     sessions: extra.sessions,
-    options: { identity: 'test-acct', log: () => {} },
+    options: { identity: 'test-acct', log: () => {}, ...extra.options },
     signal: extra.signal,
   })
 }
@@ -172,6 +172,86 @@ test('huge system prompt + large toolset degrades to compact typed signatures an
   assert.ok(p.text.includes('[Client tool calling]'), 'tool convention must survive too')
   assert.ok(p.text.includes('tool_0(arg!: string)'), 'compact typed signature preserves parameter names')
   assert.ok(byteLen(p.custom_prompt) + byteLen(p.text) <= 62 * 1024)
+})
+
+test('tool request boundary logs metadata without request or schema content', async () => {
+  const logs = []
+  const res = await req({
+    model: 'fast',
+    messages: [
+      { role: 'system', content: 'PRIVATE_SYSTEM_MARKER' },
+      { role: 'user', content: 'PRIVATE_USER_MARKER' },
+    ],
+    tools: [{ type: 'function', function: { name: 'Read', description: 'PRIVATE_DESCRIPTION_MARKER', parameters: { type: 'object', properties: { file_path: { type: 'string', description: 'PRIVATE_SCHEMA_MARKER' } } } } }],
+  }, { options: { log: (line) => logs.push(line) } })
+  assert.equal(res.status, 200, await res.text())
+  const toolLogs = logs.filter((line) => line.startsWith('[quick:tools] '))
+  assert.equal(toolLogs.length, 1, logs.join('\n'))
+  const diagnostic = JSON.parse(toolLogs[0].slice('[quick:tools] '.length))
+  assert.deepEqual(diagnostic.toolNames, ['Read'])
+  assert.equal(diagnostic.toolCount, 1)
+  assert.equal(diagnostic.requestKind, 'fresh')
+  assert.equal(diagnostic.toolResultBytes, 0)
+  assert.equal(diagnostic.preambleTier, 'full')
+  assert.equal(diagnostic.reused, false)
+  assert.equal(diagnostic.sendCustomPrompt, true)
+  assert.equal(diagnostic.truncated, false)
+  assert.deepEqual(diagnostic.truncationReasons, [])
+  assert.ok(diagnostic.instructionBytes > 0)
+  assert.ok(diagnostic.preambleBytes > 0)
+  assert.equal(diagnostic.transcriptBytes + diagnostic.preambleBytes + 4, diagnostic.textBytes)
+  assert.equal(diagnostic.customPromptBytes, diagnostic.instructionBytes)
+  for (const marker of ['PRIVATE_SYSTEM_MARKER', 'PRIVATE_USER_MARKER', 'PRIVATE_DESCRIPTION_MARKER', 'PRIVATE_SCHEMA_MARKER']) {
+    assert.ok(!toolLogs[0].includes(marker))
+  }
+})
+
+test('tool boundary reports the full tier even when descriptions contain tier marker text', async () => {
+  const logs = []
+  const res = await req({
+    model: 'fast',
+    messages: [{ role: 'user', content: 'read a file' }],
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'Read',
+        description: 'Documentation mentions names only, compact signatures and parameter schemas omitted.',
+        parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      },
+    }],
+  }, { options: { log: (line) => logs.push(line) } })
+  assert.equal(res.status, 200, await res.text())
+  const diagnostic = JSON.parse(logs.find((line) => line.startsWith('[quick:tools] ')).slice('[quick:tools] '.length))
+  assert.equal(diagnostic.preambleTier, 'full')
+  assert.ok(fake.state.userMessages.at(-1).payload.text.includes('"path":{"type":"string"}'))
+})
+
+test('tool boundary preserves every truncation reason from independent budget stages', async () => {
+  const logs = []
+  const tools = Array.from({ length: 25 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `budget_tool_${i}`,
+      description: 'D'.repeat(800),
+      parameters: { type: 'object', properties: { arg: { type: 'string', description: 'X'.repeat(400) } }, required: ['arg'] },
+    },
+  }))
+  const res = await req({
+    model: 'fast',
+    messages: [
+      { role: 'system', content: 'S'.repeat(40 * 1024) },
+      { role: 'user', content: 'U'.repeat(30 * 1024) },
+    ],
+    tools,
+  }, { options: { log: (line) => logs.push(line) } })
+  assert.equal(res.status, 200, await res.text())
+  const diagnostic = JSON.parse(logs.find((line) => line.startsWith('[quick:tools] ')).slice('[quick:tools] '.length))
+  assert.equal(diagnostic.truncated, true)
+  assert.ok(diagnostic.truncationReasons.includes('instruction-cap'))
+  assert.ok(diagnostic.truncationReasons.includes('preamble-frame-budget'))
+  assert.ok(diagnostic.truncationReasons.includes('transcript-render'))
+  assert.ok(diagnostic.instructionBytes < diagnostic.instructionSourceBytes)
+  assert.ok(diagnostic.textBytes <= 60 * 1024)
 })
 
 test('thread reuse: extended conversation continues the same thread with delta only', async () => {
@@ -563,11 +643,12 @@ test('Quick terminal tool is handed to the client shell and the result is return
       }),
     }
     const tools = [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } }]
+    const logs = []
     const first = await handleChatCompletions({
       body: { model: 'fast', messages: [{ role: 'user', content: 'list files' }], tools },
       outpostMgr: mgr,
       sessions,
-      options: { identity: 'shell-acct', log: () => {} },
+      options: { identity: 'shell-acct', log: (line) => logs.push(line) },
     })
     assert.equal(first.status, 200)
     const j1 = await first.json()
@@ -587,13 +668,22 @@ test('Quick terminal tool is handed to the client shell and the result is return
       },
       outpostMgr: mgr,
       sessions,
-      options: { identity: 'shell-acct', log: () => {} },
+      options: { identity: 'shell-acct', log: (line) => logs.push(line) },
     })
     assert.equal(second.status, 200)
     const j2 = await second.json()
     assert.match(j2.choices[0].message.content, /ran:a\.txt/)
     assert.equal(local.state.toolResults[0].tool_call_id, 'qt-1')
     assert.equal(local.state.toolResults[0].result, 'a.txt')
+    const diagnostics = logs.filter((line) => line.startsWith('[quick:tools] ')).map((line) => JSON.parse(line.slice('[quick:tools] '.length)))
+    assert.equal(diagnostics.length, 2)
+    assert.equal(diagnostics[0].requestKind, 'fresh')
+    const resultDiagnostic = diagnostics[1]
+    assert.equal(resultDiagnostic.requestKind, 'tool-result')
+    assert.equal(resultDiagnostic.toolResultBytes, jsonTextBytes('a.txt'))
+    assert.equal(resultDiagnostic.textBytes, 0)
+    assert.equal(resultDiagnostic.sendCustomPrompt, false)
+    assert.ok(!logs.some((line) => line.includes('list files')))
   } finally {
     await local.close()
   }
@@ -640,21 +730,24 @@ test('missing_thread error retries once on a fresh thread with full transcript',
         session: async () => ({ ws_host: retryFake.wsHost, id_token: 't', actor_arn: 'arn:r', usable_until: Math.floor(Date.now() / 1000) + 600 }),
       }),
     }
+    const tools = [{ type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } }]
+    const logs = []
     const r1 = await handleChatCompletions({
-      body: { model: 'fast', messages: [{ role: 'user', content: 'remember cobalt' }] },
-      outpostMgr: mgr, sessions, options: { identity: 'retry-acct', log: () => {} },
+      body: { model: 'fast', tools, messages: [{ role: 'user', content: 'remember cobalt' }] },
+      outpostMgr: mgr, sessions, options: { identity: 'retry-acct', log: (line) => logs.push(line) },
     })
     const j1 = await r1.json()
     const r2 = await handleChatCompletions({
       body: {
         model: 'fast',
+        tools,
         messages: [
           { role: 'user', content: 'remember cobalt' },
           { role: 'assistant', content: j1.choices[0].message.content },
           { role: 'user', content: 'what color?' },
         ],
       },
-      outpostMgr: mgr, sessions, options: { identity: 'retry-acct', log: () => {} },
+      outpostMgr: mgr, sessions, options: { identity: 'retry-acct', log: (line) => logs.push(line) },
     })
     assert.equal(r2.status, 200)
     await r2.json()
@@ -663,6 +756,18 @@ test('missing_thread error retries once on a fresh thread with full transcript',
     assert.equal(sent[1].threadId, sent[0].threadId) // tried cached thread
     assert.notEqual(sent[2].threadId, sent[0].threadId) // retried on fresh thread
     assert.ok(sent[2].payload.text.includes('remember cobalt')) // full transcript resent
+    const diagnostics = logs.filter((line) => line.startsWith('[quick:tools] ')).map((line) => JSON.parse(line.slice('[quick:tools] '.length)))
+    assert.equal(diagnostics.length, 3)
+    assert.deepEqual(diagnostics.map((d) => d.requestKind), ['fresh', 'reused', 'fresh-retry'])
+    const retry = diagnostics[2]
+    const retryPayload = sent[2].payload
+    assert.equal(retry.reused, false)
+    assert.equal(retry.preambleTier, 'full')
+    assert.equal(retry.preambleBytes, jsonTextBytes(retryPayload.text.slice(0, retryPayload.text.indexOf('\n\n'))))
+    assert.equal(retry.transcriptBytes + retry.preambleBytes + 4, retry.textBytes)
+    assert.equal(retry.textBytes, jsonTextBytes(retryPayload.text))
+    assert.equal(retry.customPromptBytes, retryPayload.custom_prompt ? jsonTextBytes(retryPayload.custom_prompt) : 0)
+    assert.deepEqual(retry.truncationReasons, [])
   } finally {
     await retryFake.close()
   }

@@ -86,6 +86,34 @@ test('preamble falls back to compact typed signatures when toolset is enormous',
   assert.ok(!p.includes('"properties"'))
 })
 
+test('buildToolPreamble reports the tier it actually returns', () => {
+  const tools = normalizeTools([{ type: 'function', function: { name: 'Read', description: 'names only and parameter schemas omitted are documentation text', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } }])
+  for (const [option, expected] of [[{}, 'full'], [{ compact: true }, 'compact'], [{ lite: true }, 'lite'], [{ minimal: true }, 'minimal']]) {
+    let tier
+    const preamble = buildToolPreamble(tools, 'auto', { ...option, onTier: (value) => { tier = value } })
+    assert.equal(tier, expected)
+    assert.ok(preamble.length > 0)
+  }
+})
+
+test('buildToolPreamble reports internal fallback tiers', () => {
+  const compactTools = normalizeTools(Array.from({ length: 30 }, (_, i) => ({
+    type: 'function',
+    function: { name: `fallback_${i}`, description: 'D'.repeat(2000), parameters: { type: 'object' } },
+  })))
+  let compactTier
+  buildToolPreamble(compactTools, 'auto', { onTier: (value) => { compactTier = value } })
+  assert.equal(compactTier, 'compact')
+
+  const liteTools = normalizeTools(Array.from({ length: 350 }, (_, i) => ({
+    type: 'function',
+    function: { name: `lite_fallback_${i}`, description: `${'D'.repeat(300)} ${i}`, parameters: { type: 'object' } },
+  })))
+  let liteTier
+  buildToolPreamble(liteTools, 'auto', { onTier: (value) => { liteTier = value } })
+  assert.equal(liteTier, 'lite')
+})
+
 test('parser extracts blocks split across deltas', () => {
   const p = createToolCallParser()
   let r = p.push('Hello <tool_call>{"name":"get_weather","arg')
