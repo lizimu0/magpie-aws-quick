@@ -1011,3 +1011,38 @@ test('internal tool preamble downgrade to compact signatures surfaces 64KB trunc
   assert.ok(sent.includes('compact signatures'))
   assert.match(j.choices[0].message.content, /64KB/)
 })
+
+test('GUI-scale request keeps the current user request in the sent text (not truncated away)', async () => {
+  // Mirrors the real failing GUI shape: the client packs a large context into
+  // the single current user turn (~34KB observed live, over the 20KB
+  // USER_TURN_CAP), and the real ask sits at the end. The ask must survive into
+  // the user_message text the model receives; losing it is what made AWS Quick
+  // answer "a tool-call template with no request in it".
+  const names = ['Agent','AskUserQuestion','AskUserQuestionAsync','Bash','CreateGoal','Edit','ExitPlanMode','GetGoal','Glob','Grep','ImageGen','ImageSearch','mcp_call','mcp_get','mcp_list','Monitor','NotebookEdit','Read','Skill','Sleep','TaskCreate','TaskGet','TaskList','TaskStop','TaskUpdate','UpdateGoal','VideoGen','VideoGenRetrieve','WebFetch','WebSearch','Write','SearchKnowledge','SearchWorkspace']
+  const tools = names.map((n) => ({
+    type: 'function',
+    function: {
+      name: n,
+      description: `${n} operates. `.repeat(40),
+      parameters: {
+        type: 'object',
+        required: ['p0'],
+        properties: Object.fromEntries(Array.from({ length: 6 }, (_, j) => [`p${j}`, { type: 'string', description: 'parameter description '.repeat(20) }])),
+      },
+    },
+  }))
+  const marker = 'GUIMARK-20261126-abc123'
+  const bigContext = ('上下文历史片段 previous conversation context. ').repeat(500) // >20KB, <frame budget
+  const userText = `${bigContext}\n\n请评估 https://mp.weixin.qq.com/s/${marker} 这篇。`
+  const res = await req({
+    model: 'fast',
+    messages: [
+      { role: 'system', content: 'You are Qoder, a desktop agentic assistant.' },
+      { role: 'user', content: userText },
+    ],
+    tools,
+  })
+  assert.equal(res.status, 200)
+  const sent = fake.state.userMessages.at(-1).payload.text
+  assert.ok(sent.includes(marker), 'current user request marker was truncated away from the sent text')
+})
