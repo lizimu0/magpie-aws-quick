@@ -336,6 +336,83 @@ test('tool_call convention: <tool_call> text becomes OpenAI tool_calls', async (
   }
 })
 
+test('tool_call convention recovers an omitted closing tag and accepts the client result', async () => {
+  let turnCount = 0
+  const toolFake = await startFakeQuick({
+    script: (p) => {
+      const mid = p.message_id || 'unclosed-call'
+      if (++turnCount > 1) {
+        return [
+          { type: 'text_delta', payload: { delta: 'The file contains the answer.' } },
+          { type: 'message_complete', payload: { text: 'The file contains the answer.', message_id: mid } },
+        ]
+      }
+      const output = 'Checking. <tool_call>{"name":"read_file","arguments":{"file_path":"notes/todo.md"}}'
+      return [
+        { type: 'message_start', payload: { message_id: mid } },
+        { type: 'text_delta', payload: { delta: output } },
+        { type: 'message_complete', payload: { text: output, message_id: mid } },
+      ]
+    },
+  })
+  try {
+    const mgr = {
+      ensure: async () => ({
+        outpostId: async () => 'unclosed-outpost',
+        session: async () => ({ ws_host: toolFake.wsHost, id_token: 't', usable_until: Math.floor(Date.now() / 1000) + 600 }),
+      }),
+    }
+    const sessions = createSessionStore()
+    const tools = [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object' } } }]
+    const options = { identity: 'unclosed-tool-acct' }
+    const res = await handleChatCompletions({
+      body: {
+        model: 'smart',
+        messages: [{ role: 'user', content: 'Read notes/todo.md and summarize it.' }],
+        tools,
+      },
+      outpostMgr: mgr,
+      sessions,
+      options,
+    })
+    assert.equal(res.status, 200)
+    const first = await res.json()
+    assert.equal(first.choices[0].finish_reason, 'tool_calls', JSON.stringify(first.choices[0].message))
+    assert.equal(first.choices[0].message.tool_calls.length, 1)
+    assert.ok(!first.choices[0].message.content.includes('<tool_call>'))
+    const call = first.choices[0].message.tool_calls[0]
+    assert.equal(call.function.name, 'read_file')
+    assert.deepEqual(JSON.parse(call.function.arguments), { file_path: 'notes/todo.md' })
+
+    const res2 = await handleChatCompletions({
+      body: {
+        model: 'smart',
+        messages: [
+          { role: 'user', content: 'Read notes/todo.md and summarize it.' },
+          { role: 'assistant', content: first.choices[0].message.content, tool_calls: first.choices[0].message.tool_calls },
+          { role: 'tool', tool_call_id: call.id, content: 'Finish the parser hardening.' },
+        ],
+        tools,
+      },
+      outpostMgr: mgr,
+      sessions,
+      options,
+    })
+    assert.equal(res2.status, 200)
+    const second = await res2.json()
+    assert.equal(second.choices[0].finish_reason, 'stop')
+    assert.equal(second.choices[0].message.tool_calls, undefined)
+    assert.equal(second.choices[0].message.content, 'The file contains the answer.')
+    const upstreamTurns = toolFake.state.userMessages
+    assert.equal(upstreamTurns.length, 2)
+    assert.equal(upstreamTurns[1].threadId, upstreamTurns[0].threadId)
+    assert.ok(upstreamTurns[1].payload.text.includes('[tool_result'))
+    assert.ok(upstreamTurns[1].payload.text.includes('Finish the parser hardening.'))
+  } finally {
+    await toolFake.close()
+  }
+})
+
 test('streaming tool_call emits tool_calls deltas then tool_calls finish', async () => {
   const f = await startFakeQuick({
     script: () => [
@@ -365,6 +442,42 @@ test('streaming tool_call emits tool_calls deltas then tool_calls finish', async
     assert.ok(text.includes('"name":"f"'))
     assert.ok(text.includes('"finish_reason":"tool_calls"'))
     assert.ok(!text.includes('<tool_call>')) // markup never leaks into SSE
+    assert.ok(text.trimEnd().endsWith('data: [DONE]'))
+  } finally {
+    await f.close()
+  }
+})
+
+test('streaming recovers a complete tool call with no closing tag', async () => {
+  const f = await startFakeQuick({
+    script: () => [
+      { type: 'text_delta', payload: { delta: '<tool_call>{"name":"f","arguments":{"a":1}}' } },
+      { type: 'message_complete', payload: { text: '', tool_calls: [] } },
+    ],
+  })
+  try {
+    const mgr = {
+      ensure: async () => ({
+        outpostId: async () => 'stream-unclosed-outpost',
+        session: async () => ({ ws_host: f.wsHost, id_token: 't', usable_until: Math.floor(Date.now() / 1000) + 600 }),
+      }),
+    }
+    const res = await handleChatCompletions({
+      body: {
+        model: 'fast', stream: true,
+        tools: [{ type: 'function', function: { name: 'f', parameters: { type: 'object' } } }],
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+      outpostMgr: mgr,
+      options: { identity: 'stream-unclosed-acct' },
+    })
+    assert.equal(res.status, 200)
+    const text = await res.text()
+    assert.ok(text.includes('"name":"f"'))
+    assert.ok(text.includes('"arguments":"{\\"a\\":1}"'))
+    assert.ok(text.includes('"finish_reason":"tool_calls"'))
+    assert.ok(!text.includes('<tool_call>'))
+    assert.ok(!text.includes('已忽略无效'))
     assert.ok(text.trimEnd().endsWith('data: [DONE]'))
   } finally {
     await f.close()

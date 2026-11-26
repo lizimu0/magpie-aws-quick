@@ -128,6 +128,19 @@ test('parser holds back split close tag', () => {
   assert.equal(r.calls.length, 1)
 })
 
+test('parser recovers a complete tool call when the stream omits its closing tag', () => {
+  const p = createToolCallParser()
+  const streamed = p.push('text <tool_call>{"name":"read","arguments":{"file_path":"notes/todo.md"}}')
+  assert.equal(streamed.text, 'text ')
+  assert.equal(streamed.calls.length, 0)
+
+  const end = p.end()
+  assert.equal(end.text, '')
+  assert.equal(end.dropped, undefined)
+  assert.deepEqual(end.calls, [{ name: 'read', arguments: { file_path: 'notes/todo.md' } }])
+  assert.deepEqual(p.calls, end.calls)
+})
+
 test('parser drops unterminated block without leaking it', () => {
   const p = createToolCallParser()
   p.push('text <tool_call>{"name":"x"')
