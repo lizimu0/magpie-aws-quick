@@ -248,7 +248,7 @@ test('tool boundary reports the full tier even when descriptions contain tier ma
   assert.ok(fake.state.userMessages.at(-1).payload.text.includes('"path":{"type":"string"}'))
 })
 
-test('tool boundary preserves every truncation reason from independent budget stages', async () => {
+test('tool path shrinks the system prompt so a huge user turn keeps its tail', async () => {
   const logs = []
   const tools = Array.from({ length: 25 }, (_, i) => ({
     type: 'function',
@@ -262,21 +262,19 @@ test('tool boundary preserves every truncation reason from independent budget st
     model: 'fast',
     messages: [
       { role: 'system', content: 'S'.repeat(40 * 1024) },
-      { role: 'user', content: 'U'.repeat(30 * 1024 - 8) + 'REQENDX' },
+      { role: 'user', content: 'U'.repeat(59 * 1024 - 8) + 'REQENDX' },
     ],
     tools,
   }, { options: { log: (line) => logs.push(line) } })
   assert.equal(res.status, 200, await res.text())
   const diagnostic = JSON.parse(logs.find((line) => line.startsWith('[quick:tools] ')).slice('[quick:tools] '.length))
   assert.equal(diagnostic.truncated, true)
-  assert.ok(diagnostic.truncationReasons.includes('instruction-cap'))
-  assert.ok(diagnostic.truncationReasons.includes('preamble-frame-budget'))
-  assert.ok(diagnostic.truncationReasons.includes('transcript-render'))
-  assert.ok(diagnostic.instructionBytes < diagnostic.instructionSourceBytes)
+  // The tool path shrinks the system prompt (custom_prompt) instead of clipping
+  // the request, so the huge user turn keeps its tail (the real ask).
+  assert.ok(diagnostic.instructionBytes < 10 * 1024, 'system prompt shrank for the large user turn')
   assert.ok(diagnostic.textBytes <= 60 * 1024)
-  // The user turn is tail-clipped, but its request (at the end) must survive.
   const sent = fake.state.userMessages.at(-1).payload.text
-  assert.ok(sent.includes('REQENDX'), 'the user request at the end must survive the cap')
+  assert.ok(sent.includes('REQENDX'), 'the user request at the end must survive')
 })
 
 test('thread reuse: extended conversation continues the same thread with delta only', async () => {
