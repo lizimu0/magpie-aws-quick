@@ -1,7 +1,9 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { mock } from 'node:test'
 import { startFakeQuick, defaultScript } from './helpers/fake-quick.mjs'
 import { handleChatCompletions, handleModels } from '../lib/handler.mjs'
+import { makeFetch } from '../lib/fetch.mjs'
 import { createSessionStore } from '../lib/sessions.mjs'
 import { byteLen, jsonTextBytes } from '../lib/translate.mjs'
 import { OutpostError } from '../lib/outpost.mjs'
@@ -203,6 +205,26 @@ test('tool request boundary logs metadata without request or schema content', as
   assert.equal(diagnostic.customPromptBytes, diagnostic.instructionBytes)
   for (const marker of ['PRIVATE_SYSTEM_MARKER', 'PRIVATE_USER_MARKER', 'PRIVATE_DESCRIPTION_MARKER', 'PRIVATE_SCHEMA_MARKER']) {
     assert.ok(!toolLogs[0].includes(marker))
+  }
+})
+
+test('tool request boundary falls back to stderr when the host provides no logger', async () => {
+  const stderr = mock.method(console, 'error', () => {})
+  try {
+    const res = await makeFetch(outpostMgr, {}, createSessionStore())('https://quick.aws.com/magpie-aws-quick/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'fast',
+        messages: [{ role: 'user', content: 'read a file' }],
+        tools: [{ type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }],
+      }),
+    })
+    assert.equal(res.status, 200, await res.text())
+    const lines = stderr.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.startsWith('[quick:tools] '))
+    assert.equal(lines.length, 1)
+    assert.deepEqual(JSON.parse(lines[0].slice('[quick:tools] '.length)).toolNames, ['Read'])
+  } finally {
+    stderr.mock.restore()
   }
 })
 
