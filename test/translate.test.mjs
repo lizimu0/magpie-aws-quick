@@ -114,14 +114,15 @@ test('renderTranscript drops oldest history first, keeps final user turn', () =>
   assert.ok(byteLen(out) <= 8000)
 })
 
-test('renderTranscript caps oversized system prompt and user turn', () => {
-  const messages = [{ role: 'user', content: 'u'.repeat(30 * 1024) }]
+test('renderTranscript keeps the newest user turn whole and caps the system prompt', () => {
+  const user = 'u'.repeat(30 * 1024)
+  const messages = [{ role: 'user', content: user }]
   const stats = {}
   const out = renderTranscript(messages, 's'.repeat(40 * 1024), { maxBytes: UPSTREAM_TEXT_LIMIT, stats })
-  assert.ok(stats.truncated)
-  assert.ok(out.includes('[truncated]'))
+  assert.ok(stats.truncated) // system prompt was capped to make room
   assert.ok(byteLen(out) <= UPSTREAM_TEXT_LIMIT)
-  assert.ok(out.endsWith('[truncated]')) // user turn itself was capped
+  assert.ok(out.includes(user)) // the current request is preserved whole (not clipped to 20KB)
+  assert.ok(out.endsWith(user)) // and it is the tail the model reads last
 })
 
 test('renderDelta caps oversized tool results per block', () => {
